@@ -11,7 +11,20 @@
 
 // ==WindhawkModReadme==
 /*
-  ...
+# Taskbar Media Controller
+
+A Taskbar Media that uses Windows 11 native DWM styling for a seamless look.
+
+## ✨ Features
+* **Universal Support:** Works with any media player via GSMTC.
+* **Album Art:** Displays current track cover art.
+* **Native Look:** Uses Windows 11 hardware-accelerated rounding and acrylic blur.
+* **Controls:** Play/Pause, Next, Previous.
+* **Volume:** Scroll over widget to adjust volume.
+
+## ⚠️ Requirements
+* **Disable Widgets:** Taskbar Settings -> Widgets -> Off.
+* **Windows 11:** Required for rounded corners.
 */
 // ==/WindhawkModReadme==
 
@@ -39,12 +52,11 @@
   $name: Show Window Border
 - TransparentBackground: false
   $name: Fully Transparent Background (No Blur)
+- HideInFullscreen: false
+  $name: Hide in Fullscreen
+  $description: Automatically hide the panel when a fullscreen window is detected.
 */
 // ==/WindhawkModSettings==
-
-
-
-
 
 #include <windows.h>
 #include <shellapi.h>
@@ -160,6 +172,72 @@ struct ModSettings {
 HWND g_hMediaWindow = NULL;
 bool g_Running = true; 
 int g_HoverState = 0; 
+
+// --- Fullscreen Detection ---
+struct FullscreenState {
+    bool isFullscreen = false;
+    HWND lastForeground = NULL;
+    std::atomic<bool> checkThreadRunning{false};
+    std::thread* checkThread = nullptr;
+    std::mutex lock;
+    bool hideInFullscreen = false; // Track setting
+} g_FullscreenState;
+
+bool IsWindowFullscreen(HWND hwnd) {
+    if (!hwnd || !IsWindowVisible(hwnd)) return false;
+    
+    // Get window rect
+    RECT wndRect;
+    if (!GetWindowRect(hwnd, &wndRect)) return false;
+    
+    // Get monitor info
+    HMONITOR hMonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi = { sizeof(MONITORINFO) };
+    if (!GetMonitorInfo(hMonitor, &mi)) return false;
+    
+    // Check if window covers entire monitor
+    return (wndRect.left <= mi.rcMonitor.left &&
+            wndRect.top <= mi.rcMonitor.top &&
+            wndRect.right >= mi.rcMonitor.right &&
+            wndRect.bottom >= mi.rcMonitor.bottom);
+}
+
+void CheckFullscreenLoop() {
+    while (g_FullscreenState.checkThreadRunning) {
+        // Only check if feature is enabled
+        if (!g_FullscreenState.hideInFullscreen) {
+            Sleep(500);
+            continue;
+        }
+        
+        HWND hForeground = GetForegroundWindow();
+        bool isFs = false;
+        
+        if (hForeground && hForeground != g_hMediaWindow) {
+            // Skip taskbar and desktop
+            WCHAR className[256];
+            GetClassName(hForeground, className, 256);
+            if (wcscmp(className, L"Shell_TrayWnd") != 0 &&
+                wcscmp(className, L"WorkerW") != 0 &&
+                wcscmp(className, L"Progman") != 0) {
+                isFs = IsWindowFullscreen(hForeground);
+            }
+        }
+        
+        {
+            std::lock_guard<std::mutex> guard(g_FullscreenState.lock);
+            if (g_FullscreenState.isFullscreen != isFs) {
+                g_FullscreenState.isFullscreen = isFs;
+                if (g_hMediaWindow) {
+                    ShowWindow(g_hMediaWindow, isFs ? SW_HIDE : SW_SHOW);
+                }
+            }
+            g_FullscreenState.lastForeground = hForeground;
+        }
+        
+        Sleep(500); // Check every 500ms
+    }
+}
 
 // Data Model
 struct MediaState {
@@ -296,14 +374,10 @@ void UpdateAppearance(HWND hwnd) {
     DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &preference, sizeof(preference));
 
     // 2. Border Setting
-    // 34 is DWMWA_BORDER_COLOR. 
-    // If transparent, we force NO border (color NONE).
-    // Otherwise, we check the user setting.
     COLORREF borderColor = (g_Settings.transparentBg || !g_Settings.showBorder) ? 0xFFFFFFFE : 0xFFFFFFFF; 
     DwmSetWindowAttribute(hwnd, 34, &borderColor, sizeof(borderColor));
 
     // 3. Shadow Setting (DWMWA_NCRENDERING_POLICY = 2)
-    // 1 = DWMNCRP_DISABLED (No Shadow/Frame), 2 = DWMNCRP_ENABLED (Shadow/Frame)
     DWORD ncPolicy = g_Settings.transparentBg ? 1 : 2; 
     DwmSetWindowAttribute(hwnd, 2, &ncPolicy, sizeof(ncPolicy));
 
@@ -338,18 +412,16 @@ void UpdateAppearance(HWND hwnd) {
             SetComp(hwnd, &data);
         }
     }
+    // Force DWM refresh
+    SetWindowPos(hwnd, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE);
 }
 
 void DrawMediaPanel(HDC hdc, int width, int height) {
     Graphics graphics(hdc);
     graphics.SetSmoothingMode(SmoothingModeAntiAlias);
-    // FIX: AntiAlias (Greyscale) looks smoother on glass than ClearType
     graphics.SetTextRenderingHint(TextRenderingHintAntiAlias);
     graphics.Clear(Color(0, 0, 0, 0)); 
 
-    // NO BACKGROUND DRAWING HERE. 
-    // We let the DWM Acrylic blur handle the background.
-    
     Color mainColor{GetCurrentTextColor()};
     
     // Lock Data
@@ -452,7 +524,8 @@ void DrawMediaPanel(HDC hdc, int width, int height) {
 LRESULT CALLBACK MediaWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE: 
-            UpdateAppearance(hwnd); // Apply DWM Rounding + Acrylic + Border Settings
+            // FIX: DO NOT call UpdateAppearance here. It's too early for DWM transparency.
+            // We only start the timer here.
             SetTimer(hwnd, IDT_POLL_MEDIA, 1000, NULL); 
             return 0;
 
@@ -593,10 +666,11 @@ void MediaThread() {
     }
 
     if (CreateWindowInBand) {
+        // FIX: Removed WS_VISIBLE. Created hidden first.
         g_hMediaWindow = CreateWindowInBand(
             WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
             wc.lpszClassName, TEXT("MusicLounge"),
-            WS_POPUP | WS_VISIBLE,
+            WS_POPUP, // <--- No WS_VISIBLE here
             0, 0, g_Settings.width, g_Settings.height,
             NULL, NULL, wc.hInstance, NULL,
             ZBID_IMMERSIVE_NOTIFICATION
@@ -609,17 +683,26 @@ void MediaThread() {
     // Fallback to CreateWindowEx if CreateWindowInBand failed or unavailable
     if (!g_hMediaWindow) {
         Wh_Log(L"CreateWindowInBand failed or unavailable, falling back to CreateWindowEx");
+        // FIX: Removed WS_VISIBLE. Created hidden first.
         g_hMediaWindow = CreateWindowEx(
             WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
             wc.lpszClassName, TEXT("MusicLounge"),
-            WS_POPUP | WS_VISIBLE,
+            WS_POPUP, // <--- No WS_VISIBLE here
             0, 0, g_Settings.width, g_Settings.height,
             NULL, NULL, wc.hInstance, NULL
         );
     }
-
-    SetLayeredWindowAttributes(g_hMediaWindow, 0, 255, LWA_ALPHA);
     
+    // 1. Set Layer Attributes (Make it capable of transparency)
+    SetLayeredWindowAttributes(g_hMediaWindow, 0, 255, LWA_ALPHA);
+
+    // 2. NOW Apply DWM settings (Pink Fix)
+    UpdateAppearance(g_hMediaWindow);
+
+    // 3. Show the Window explicitly
+    ShowWindow(g_hMediaWindow, SW_SHOW);
+    UpdateWindow(g_hMediaWindow);
+
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) {
         TranslateMessage(&msg);
